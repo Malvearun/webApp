@@ -1,0 +1,177 @@
+name: Webapp-pipeline_$(date:yyyyMMdd)$(rev:.r)
+resources:
+  repositories:
+    - repository: WebApp
+      type: git #azure git
+      ref: feature/WebApp
+
+trigger:
+  branches:
+    include:
+    - feature/webapp
+  paths:
+    include:
+     - /variables.yml
+
+stages:
+- stage: GetInfraArtifacts
+  dependsOn: []
+  jobs:
+  - job: GetInfraArtifacts
+  pool:
+    vmImage: 'windows-latest'
+    continueOnError: true
+    steps:
+    - checkout: self
+    - checkout: feature/WebApp
+    - tasks: CopyFiles@2
+      displayName: 'Copy webapp deploy scripts' 
+      input:
+        SourceFolder: '$(System.DefaultWorkingDirectory)\WebApp'
+        Contents: |
+          */*deployment.ps1
+          */*webapp
+          */*sql.ps1
+        TargetFolder: '$(Build.StagingDirectory)'
+        CleanTargetFolder: true
+        flattenFolder: true
+
+# - stage: ApproveRelease
+#   dependsOn:
+#   - GetInfraArtifacts
+#   condition: and(succeeded), eq(variables['Build.Reason'], 'Manual')
+#   jobs:
+#   -deployment: ReviewRelease
+#    pool: 'Test-VMSS' # VM pool
+#    environment: Test
+
+- stage: Deploy-WebApp
+  dependsOn:
+  - ApproveRelease
+  condition: and(succeeded ('GetInfraArtifacts'), not(failed('ApprovalRelease')), eq(variables['deployWebApp'], 'true'))
+  variables:
+  - template: ../variables.yml
+  jobs:
+  - job: Azure Login
+    timeoutInMinutes: 0
+    pool: 
+      name: 'Test-VMSS' # VM pool
+    steps:
+    - task: AzureCLI@2
+      displayName: Azure CLI
+      inputs:
+        azureSubscription: <Name of the Azure Resource Manager service connection>
+        scriptType: ps
+        scriptLocation: inlineScript
+        inlineScript: |
+          az --version
+          az account show
+          Set-AzContext -subscriptionId $subscriptionId
+        run: >
+          az group create
+          -l ${{ env.RESOURCE_GROUP_LOCATION }}
+          -n ${{ env.RESOURCE_GROUP_NAME }}
+  - job: DeploymentWebApp
+    timeoutInMinutes: 0
+    pool: 
+      name: 'Test-VMSS' # VM pool
+    steps:
+    - download: current
+      artifacts: standardPlatform
+    - powershell:
+        cp '$(Pipeline.Workspace)\pipeline.yml' '$(Pipeline.Workspace)\pipeline.yml' -Force
+    - task: AzurePowerShell@5
+      displayName: 'Deploy WebApp'
+      inputs:
+        azureSubscription: 
+        ScriptPath: '$(Pipeline.Workspace)\azure-pipeline\deployment.ps1'
+        ScriptArguments: '-subscriptionId ${{variables.subscriptioniD }}'
+        errorActionPreference: stop
+        preferredAzurePowerShellVersion: 3.1.0
+
+- stage: WebApp endpoint
+  dependsOn:
+  - Deploy-WebApp
+  condition: and(succeeded ('Deploy-WebApp'), not(failed('ApprovalRelease')))
+  variables:
+  - template: ../variables.yml
+  jobs:
+  - job: 
+    timeoutInMinutes: 0
+    displayName: 'WebApp endpoint'
+    pool: 
+      name: 'Test-VMSS'
+    steps:
+    - task: AzureCLI@2
+      displayName: 'WebApp endpoint'
+      run: >
+      # echo https://webapp.azurewebsites.net/
+
+
+- stage: ManualVerification-WebApp
+  dependsOn:
+  - Deploy-WebApp
+  - WebApp endpoint
+  condition: and(succeeded ('Deploy-WebApp'), not(failed('ApprovalRelease')), eq(variables['deployWebApp'], 'true'))
+  jobs:
+  - job: 
+    displayName: 'Checks'
+    pool: 
+      name: 'Test-VMSS'
+    timeoutInMinutes: 120
+    steps:
+    - task: ManualValidation@0
+      timeoutInMinutes: 120
+      inputs:
+        notifyUsers: |
+        instructions: 'Validate with WebApp'
+        onTimeout: 'reject'
+
+# - stage: ApproveReleaseSQL
+#   dependsOn:
+#   - ManualVerification-WebApp
+#   condition: and(succeeded ('ManualVerification-WebApp'), not(failed('ApprovalRelease')))
+#   jobs:
+#   - deployment: ReviewRelease
+#     pool: 'Test-VMSS' # VM pool
+#     environment: Test
+
+- stage: SQL-DTU
+  dependsOn:
+  - ManualVerification-WebApp
+  - GetInfraArtifacts
+  condition: and(succeeded ('ManualVerification-WebApp'), not(failed('ApprovalRelease')))
+  variables:
+  - template: ../variables/variables.yml
+  steps:
+    - powershell:
+        cp '$(Pipeline.Workspace)\sql.ps1' '$(Pipeline.Workspace)\sql.ps1' -Force
+    - task: AzurePowerShell@5
+      displayName: 'change the DTU database'
+      inputs:
+        azureSubscription: 
+        ScriptPath: '$(Pipeline.Workspace)\sql.ps1'
+        ScriptArguments: '-subscriptionId ${{variables.subscriptioniD }}'
+        errorActionPreference: stop
+        preferredAzurePowerShellVersion: 3.1.0
+
+- stage: CleanUp_WebApp
+  dependsOn:
+  - SQL-DTU
+  - ManualVerification-WebApp
+  condition: always()
+  jobs:
+  - job: CleanUp
+    pool:
+      name: 'Test-VMSS'
+    steps:
+    - task: DeleteFiles@1
+      inputs:
+        SourceFolder: '$(System.DefaultWorkingDirectory)'
+        Contents: '**/*'
+    - task: DeleteFiles@1
+      inputs:
+        SourceFolder: '$(Pipeline.Workspace)'
+        Contents: '**/*'
+
+

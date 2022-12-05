@@ -1,0 +1,6 @@
+variables:
+  subscriptionId: #subid
+  deployWebApp: true
+  RESOURCE_GROUP_NAME: bicep-rg
+  RESOURCE_GROUP_LOCATION: australiasoutheast
+  ENV_NAME: test
